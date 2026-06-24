@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from functools import lru_cache
 
 from pydantic import Field
@@ -7,7 +9,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(extra="ignore")
 
     app_env: str = Field(default="development", alias="APP_ENV")
     app_public_base_url: str = Field(default="http://localhost:8000", alias="APP_PUBLIC_BASE_URL")
@@ -32,4 +34,5 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
-    return Settings()  # type: ignore[call-arg]
+    env_file = os.getenv("VOICE_LEAD_AGENT_ENV_FILE", ".env")
+    return Settings(_env_file=env_file)  # type: ignore[call-arg]

@@ -8,9 +8,10 @@ from typing import cast
 from urllib.parse import parse_qsl
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, WebSocket, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.websockets import WebSocketDisconnect
 
 from voice_lead_agent.auth import require_trusted_source
 from voice_lead_agent.config import Settings, get_settings
@@ -245,6 +246,29 @@ def create_app(
         )
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
+    @app.websocket("/ws/twilio/conversationrelay")
+    async def conversation_relay(
+        websocket: WebSocket,
+        verifier: TwilioSignatureVerifier = Depends(  # noqa: B008
+            current_twilio_signature_verifier
+        ),
+    ) -> None:
+        signature = websocket.headers.get("x-twilio-signature")
+        params: dict[str, str] = {}
+        if not verifier.validate(
+            url=public_ws_url_for_request(websocket, current_settings()),
+            params=params,
+            signature=signature,
+        ):
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+        await websocket.accept()
+        try:
+            while True:
+                await websocket.receive_text()
+        except WebSocketDisconnect:
+            pass
+
     return app
 
 
@@ -303,3 +327,12 @@ def public_url_for_request(request: Request, settings: Settings) -> str:
     path = request.url.path
     query = f"?{request.url.query}" if request.url.query else ""
     return f"{settings.app_public_base_url.rstrip('/')}{path}{query}"
+
+
+def public_ws_url_for_request(websocket: WebSocket, settings: Settings) -> str:
+    base = settings.app_public_base_url.rstrip("/")
+    ws_base = base.replace("https://", "wss://").replace("http://", "ws://")
+    path = websocket.url.path
+    raw_query = websocket.scope.get("query_string", b"").decode("latin-1")
+    query = f"?{raw_query}" if raw_query else ""
+    return f"{ws_base}{path}{query}"

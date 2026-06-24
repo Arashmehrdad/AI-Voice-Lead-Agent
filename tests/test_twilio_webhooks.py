@@ -14,12 +14,13 @@ from voice_lead_agent.domain import ProviderEventResult
 class FakeSignatureVerifier:
     valid: bool
     calls: int = 0
+    last_url: str = ""
 
     def validate(self, *, url: str, params: dict[str, str], signature: str | None) -> bool:
         self.calls += 1
-        assert url.startswith("http://testserver/webhooks/twilio/")
-        assert signature is not None
-        assert params
+        self.last_url = url
+        if signature is None:
+            return False
         return self.valid
 
 
