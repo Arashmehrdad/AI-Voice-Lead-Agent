@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-
 from functools import lru_cache
 
 from pydantic import Field
@@ -30,6 +29,30 @@ class Settings(BaseSettings):
     twilio_account_sid: str | None = Field(default=None, alias="TWILIO_ACCOUNT_SID")
     twilio_auth_token: str | None = Field(default=None, alias="TWILIO_AUTH_TOKEN")
     twilio_caller_id: str | None = Field(default=None, alias="TWILIO_CALLER_ID")
+
+    # Gemini conversation loop (Stage 4). No default API key: callers must provide one.
+    gemini_api_key: str | None = Field(default=None, alias="GEMINI_API_KEY")
+    gemini_model: str = Field(default="gemini-2.0-flash", alias="GEMINI_MODEL")
+    gemini_timeout_seconds: float = Field(default=15.0, alias="GEMINI_TIMEOUT_SECONDS")
+    gemini_max_output_tokens: int = Field(default=256, alias="GEMINI_MAX_OUTPUT_TOKENS")
+    gemini_temperature: float = Field(default=0.2, alias="GEMINI_TEMPERATURE")
+    conversation_max_turns: int = Field(default=10, alias="CONVERSATION_MAX_TURNS")
+
+    # Conversation disclosure content. Loaded from environment, never hard-coded secrets.
+    business_name: str = Field(default="AI Voice Lead Agent", alias="BUSINESS_NAME")
+    ai_disclosure_text: str = Field(
+        default=(
+            "This is an automated AI assistant calling on behalf of the business. "
+            "You can ask to speak with a human or ask me to stop calling at any time."
+        ),
+        alias="AI_DISCLOSURE_TEXT",
+    )
+    human_help_text: str = Field(
+        default=(
+            "I'll arrange for a member of our team to follow up with you. Thank you for your time."
+        ),
+        alias="HUMAN_HELP_TEXT",
+    )
 
 
 @lru_cache
