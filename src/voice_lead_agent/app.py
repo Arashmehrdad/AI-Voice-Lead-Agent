@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -15,6 +16,11 @@ from starlette.websockets import WebSocketDisconnect
 
 from voice_lead_agent.auth import require_trusted_source
 from voice_lead_agent.config import Settings, get_settings
+from voice_lead_agent.conversation_relay_protocol import (
+    ConversationRelayParseError,
+    SetupEvent,
+    parse_inbound_event,
+)
 from voice_lead_agent.errors import ApiError
 from voice_lead_agent.repositories import LeadRepository, TwilioWebhookRepository
 from voice_lead_agent.schemas import (
@@ -31,6 +37,8 @@ from voice_lead_agent.twiml import fixed_stage3_twiml
 
 REQUEST_ID_HEADER = "X-Request-Id"
 MIGRATION_VERSION = "0001_initial_schema"
+
+_log = logging.getLogger(__name__)
 
 
 def create_app(
@@ -263,9 +271,24 @@ def create_app(
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
             return
         await websocket.accept()
+        setup_received = False
         try:
             while True:
-                await websocket.receive_text()
+                raw = await websocket.receive_text()
+                try:
+                    event = parse_inbound_event(raw)
+                except ConversationRelayParseError as exc:
+                    _log.warning("ConversationRelay parse error: %s", exc.category)
+                    await websocket.close(code=status.WS_1007_INVALID_FRAME_PAYLOAD_DATA)
+                    return
+                if isinstance(event, SetupEvent):
+                    if setup_received:
+                        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+                        return
+                    setup_received = True
+                elif not setup_received:
+                    await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+                    return
         except WebSocketDisconnect:
             pass
 

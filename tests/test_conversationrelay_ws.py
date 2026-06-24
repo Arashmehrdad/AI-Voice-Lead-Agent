@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import logging
 from dataclasses import dataclass, field
 from unittest.mock import MagicMock
 
@@ -214,6 +216,309 @@ def test_signature_verifier_receives_ws_url() -> None:
         pass
     assert verifier.calls == 1
     assert verifier.last_url.startswith("ws://testserver/ws/twilio/conversationrelay")
+
+
+def _make_setup_payload() -> str:
+    return json.dumps(
+        {
+            "type": "setup",
+            "sessionId": "VX123",
+            "callSid": "CA123",
+            "accountSid": "AC123",
+            "from": "+15551234567",
+            "to": "+15559876543",
+        }
+    )
+
+
+def test_valid_setup_accepted() -> None:
+    app = create_app(
+        settings=make_settings(),
+        repository=InMemoryLeadRepository(),
+        twilio_webhook_repository=FakeTwilioWebhookRepository(),
+        twilio_signature_verifier=FakeSignatureVerifier(valid=True),
+    )
+    client = TestClient(app)
+    with client.websocket_connect(
+        "/ws/twilio/conversationrelay",
+        headers={"X-Twilio-Signature": "valid"},
+    ) as ws:
+        ws.send_text(_make_setup_payload())
+
+
+def test_prompt_event_after_setup() -> None:
+    app = create_app(
+        settings=make_settings(),
+        repository=InMemoryLeadRepository(),
+        twilio_webhook_repository=FakeTwilioWebhookRepository(),
+        twilio_signature_verifier=FakeSignatureVerifier(valid=True),
+    )
+    client = TestClient(app)
+    with client.websocket_connect(
+        "/ws/twilio/conversationrelay",
+        headers={"X-Twilio-Signature": "valid"},
+    ) as ws:
+        ws.send_text(_make_setup_payload())
+        ws.send_text(
+            json.dumps(
+                {
+                    "type": "prompt",
+                    "voicePrompt": "Hello",
+                    "lang": "en-US",
+                    "last": True,
+                }
+            )
+        )
+
+
+def test_interrupt_event_after_setup() -> None:
+    app = create_app(
+        settings=make_settings(),
+        repository=InMemoryLeadRepository(),
+        twilio_webhook_repository=FakeTwilioWebhookRepository(),
+        twilio_signature_verifier=FakeSignatureVerifier(valid=True),
+    )
+    client = TestClient(app)
+    with client.websocket_connect(
+        "/ws/twilio/conversationrelay",
+        headers={"X-Twilio-Signature": "valid"},
+    ) as ws:
+        ws.send_text(_make_setup_payload())
+        ws.send_text(
+            json.dumps(
+                {
+                    "type": "interrupt",
+                    "utteranceUntilInterrupt": "stop",
+                    "durationUntilInterruptMs": 500,
+                }
+            )
+        )
+
+
+def test_dtmf_event_after_setup() -> None:
+    app = create_app(
+        settings=make_settings(),
+        repository=InMemoryLeadRepository(),
+        twilio_webhook_repository=FakeTwilioWebhookRepository(),
+        twilio_signature_verifier=FakeSignatureVerifier(valid=True),
+    )
+    client = TestClient(app)
+    with client.websocket_connect(
+        "/ws/twilio/conversationrelay",
+        headers={"X-Twilio-Signature": "valid"},
+    ) as ws:
+        ws.send_text(_make_setup_payload())
+        ws.send_text(json.dumps({"type": "dtmf", "digit": "5"}))
+
+
+def test_error_event_after_setup() -> None:
+    app = create_app(
+        settings=make_settings(),
+        repository=InMemoryLeadRepository(),
+        twilio_webhook_repository=FakeTwilioWebhookRepository(),
+        twilio_signature_verifier=FakeSignatureVerifier(valid=True),
+    )
+    client = TestClient(app)
+    with client.websocket_connect(
+        "/ws/twilio/conversationrelay",
+        headers={"X-Twilio-Signature": "valid"},
+    ) as ws:
+        ws.send_text(_make_setup_payload())
+        ws.send_text(json.dumps({"type": "error", "description": "timeout"}))
+
+
+def test_prompt_before_setup_closes_1008() -> None:
+    app = create_app(
+        settings=make_settings(),
+        repository=InMemoryLeadRepository(),
+        twilio_webhook_repository=FakeTwilioWebhookRepository(),
+        twilio_signature_verifier=FakeSignatureVerifier(valid=True),
+    )
+    client = TestClient(app)
+    with (
+        pytest.raises(WebSocketDisconnect) as exc_info,
+        client.websocket_connect(
+            "/ws/twilio/conversationrelay",
+            headers={"X-Twilio-Signature": "valid"},
+        ) as ws,
+    ):
+        ws.send_text(
+            json.dumps(
+                {
+                    "type": "prompt",
+                    "voicePrompt": "Hello",
+                    "lang": "en-US",
+                    "last": True,
+                }
+            )
+        )
+        ws.receive_text()
+    assert exc_info.value.code == 1008
+
+
+def test_dtmf_before_setup_closes_1008() -> None:
+    app = create_app(
+        settings=make_settings(),
+        repository=InMemoryLeadRepository(),
+        twilio_webhook_repository=FakeTwilioWebhookRepository(),
+        twilio_signature_verifier=FakeSignatureVerifier(valid=True),
+    )
+    client = TestClient(app)
+    with (
+        pytest.raises(WebSocketDisconnect) as exc_info,
+        client.websocket_connect(
+            "/ws/twilio/conversationrelay",
+            headers={"X-Twilio-Signature": "valid"},
+        ) as ws,
+    ):
+        ws.send_text(json.dumps({"type": "dtmf", "digit": "1"}))
+        ws.receive_text()
+    assert exc_info.value.code == 1008
+
+
+def test_duplicate_setup_closes_1008() -> None:
+    app = create_app(
+        settings=make_settings(),
+        repository=InMemoryLeadRepository(),
+        twilio_webhook_repository=FakeTwilioWebhookRepository(),
+        twilio_signature_verifier=FakeSignatureVerifier(valid=True),
+    )
+    client = TestClient(app)
+    with (
+        pytest.raises(WebSocketDisconnect) as exc_info,
+        client.websocket_connect(
+            "/ws/twilio/conversationrelay",
+            headers={"X-Twilio-Signature": "valid"},
+        ) as ws,
+    ):
+        ws.send_text(_make_setup_payload())
+        ws.send_text(_make_setup_payload())
+        ws.receive_text()
+    assert exc_info.value.code == 1008
+
+
+def test_malformed_json_closes_1007() -> None:
+    app = create_app(
+        settings=make_settings(),
+        repository=InMemoryLeadRepository(),
+        twilio_webhook_repository=FakeTwilioWebhookRepository(),
+        twilio_signature_verifier=FakeSignatureVerifier(valid=True),
+    )
+    client = TestClient(app)
+    with (
+        pytest.raises(WebSocketDisconnect) as exc_info,
+        client.websocket_connect(
+            "/ws/twilio/conversationrelay",
+            headers={"X-Twilio-Signature": "valid"},
+        ) as ws,
+    ):
+        ws.send_text("not-json{{{")
+        ws.receive_text()
+    assert exc_info.value.code == 1007
+
+
+def test_unknown_event_type_closes_1007() -> None:
+    app = create_app(
+        settings=make_settings(),
+        repository=InMemoryLeadRepository(),
+        twilio_webhook_repository=FakeTwilioWebhookRepository(),
+        twilio_signature_verifier=FakeSignatureVerifier(valid=True),
+    )
+    client = TestClient(app)
+    with (
+        pytest.raises(WebSocketDisconnect) as exc_info,
+        client.websocket_connect(
+            "/ws/twilio/conversationrelay",
+            headers={"X-Twilio-Signature": "valid"},
+        ) as ws,
+    ):
+        ws.send_text(json.dumps({"type": "unknown_future_event"}))
+        ws.receive_text()
+    assert exc_info.value.code == 1007
+
+
+def test_known_event_invalid_fields_closes_1007() -> None:
+    app = create_app(
+        settings=make_settings(),
+        repository=InMemoryLeadRepository(),
+        twilio_webhook_repository=FakeTwilioWebhookRepository(),
+        twilio_signature_verifier=FakeSignatureVerifier(valid=True),
+    )
+    client = TestClient(app)
+    with (
+        pytest.raises(WebSocketDisconnect) as exc_info,
+        client.websocket_connect(
+            "/ws/twilio/conversationrelay",
+            headers={"X-Twilio-Signature": "valid"},
+        ) as ws,
+    ):
+        # setup with blank sessionId fails validation
+        ws.send_text(
+            json.dumps(
+                {
+                    "type": "setup",
+                    "sessionId": "",
+                    "callSid": "CA123",
+                    "accountSid": "AC123",
+                    "from": "+15551234567",
+                    "to": "+15559876543",
+                }
+            )
+        )
+        ws.receive_text()
+    assert exc_info.value.code == 1007
+
+
+def test_graceful_disconnect_after_setup() -> None:
+    app = create_app(
+        settings=make_settings(),
+        repository=InMemoryLeadRepository(),
+        twilio_webhook_repository=FakeTwilioWebhookRepository(),
+        twilio_signature_verifier=FakeSignatureVerifier(valid=True),
+    )
+    client = TestClient(app)
+    with client.websocket_connect(
+        "/ws/twilio/conversationrelay",
+        headers={"X-Twilio-Signature": "valid"},
+    ) as ws:
+        ws.send_text(_make_setup_payload())
+        ws.close()
+
+
+def test_no_sensitive_payload_in_logs(caplog: pytest.LogCaptureFixture) -> None:
+    app = create_app(
+        settings=make_settings(),
+        repository=InMemoryLeadRepository(),
+        twilio_webhook_repository=FakeTwilioWebhookRepository(),
+        twilio_signature_verifier=FakeSignatureVerifier(valid=True),
+    )
+    client = TestClient(app)
+    with (
+        caplog.at_level(logging.WARNING),
+        pytest.raises(WebSocketDisconnect),
+        client.websocket_connect(
+            "/ws/twilio/conversationrelay",
+            headers={"X-Twilio-Signature": "valid"},
+        ) as ws,
+    ):
+        ws.send_text(
+            json.dumps(
+                {
+                    "type": "setup",
+                    "sessionId": "",
+                    "callSid": "CA123",
+                    "accountSid": "AC123",
+                    "from": "+15551234567",
+                    "to": "+15559876543",
+                    "customParameters": {"lead_id": "secret"},
+                }
+            )
+        )
+        ws.receive_text()
+    full_log = " ".join(r.message for r in caplog.records)
+    assert "+15551234567" not in full_log
+    assert "secret" not in full_log
+    assert "CA123" not in full_log
 
 
 def test_disconnect_handled_gracefully() -> None:
