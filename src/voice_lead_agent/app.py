@@ -3,6 +3,9 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
+from hashlib import sha256
+from typing import cast
+from urllib.parse import parse_qsl
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, status
@@ -12,7 +15,7 @@ from fastapi.responses import JSONResponse
 from voice_lead_agent.auth import require_trusted_source
 from voice_lead_agent.config import Settings, get_settings
 from voice_lead_agent.errors import ApiError
-from voice_lead_agent.repositories import LeadRepository
+from voice_lead_agent.repositories import LeadRepository, TwilioWebhookRepository
 from voice_lead_agent.schemas import (
     LeadIntakeRequest,
     LeadIntakeResponse,
@@ -22,6 +25,8 @@ from voice_lead_agent.schemas import (
     ReadyResponse,
 )
 from voice_lead_agent.service import intake_lead
+from voice_lead_agent.twilio_adapter import TwilioRequestValidator, TwilioSignatureVerifier
+from voice_lead_agent.twiml import fixed_stage3_twiml
 
 REQUEST_ID_HEADER = "X-Request-Id"
 MIGRATION_VERSION = "0001_initial_schema"
@@ -31,9 +36,13 @@ def create_app(
     *,
     settings: Settings | None = None,
     repository: LeadRepository | None = None,
+    twilio_webhook_repository: TwilioWebhookRepository | None = None,
+    twilio_signature_verifier: TwilioSignatureVerifier | None = None,
 ) -> FastAPI:
     resolved_settings = settings
     resolved_repository = repository
+    resolved_twilio_webhook_repository = twilio_webhook_repository
+    resolved_twilio_signature_verifier = twilio_signature_verifier
     resolved_engine = None
 
     @asynccontextmanager
@@ -71,6 +80,21 @@ def create_app(
             resolved_engine = create_engine(current.database_url)
             resolved_repository = SqlLeadRepository(create_sessionmaker(resolved_engine))
         return resolved_repository
+
+    def current_twilio_webhook_repository() -> TwilioWebhookRepository:
+        nonlocal resolved_twilio_webhook_repository
+        if resolved_twilio_webhook_repository is None:
+            resolved_twilio_webhook_repository = current_repository()  # type: ignore[assignment]
+        return cast(TwilioWebhookRepository, resolved_twilio_webhook_repository)
+
+    def current_twilio_signature_verifier() -> TwilioSignatureVerifier:
+        nonlocal resolved_twilio_signature_verifier
+        if resolved_twilio_signature_verifier is None:
+            current = current_settings()
+            if current.twilio_auth_token is None:
+                raise RuntimeError("TWILIO_AUTH_TOKEN is required for Twilio webhooks.")
+            resolved_twilio_signature_verifier = TwilioRequestValidator(current.twilio_auth_token)
+        return resolved_twilio_signature_verifier
 
     async def trusted_source_dependency(
         authorization: str | None = Header(default=None),
@@ -162,6 +186,65 @@ def create_app(
             ).model_dump(),
         )
 
+    @app.post("/webhooks/twilio/voice/start")
+    async def twilio_voice_start(
+        request: Request,
+        verifier: TwilioSignatureVerifier = Depends(  # noqa: B008
+            current_twilio_signature_verifier
+        ),
+    ) -> Response:
+        body = await request.body()
+        params = parse_form_body(body)
+        signature = request.headers.get("x-twilio-signature")
+        if not verifier.validate(
+            url=public_url_for_request(request, current_settings()),
+            params=params,
+            signature=signature,
+        ):
+            return error_response(
+                request=request,
+                status_code=status.HTTP_403_FORBIDDEN,
+                code="invalid_signature",
+                message="Invalid webhook signature.",
+                retryable=False,
+            )
+        return Response(
+            content=fixed_stage3_twiml(),
+            media_type="application/xml",
+            status_code=status.HTTP_200_OK,
+        )
+
+    @app.post("/webhooks/twilio/call-status")
+    async def twilio_call_status(
+        request: Request,
+        verifier: TwilioSignatureVerifier = Depends(  # noqa: B008
+            current_twilio_signature_verifier
+        ),
+        repo: TwilioWebhookRepository = Depends(  # noqa: B008
+            current_twilio_webhook_repository
+        ),
+    ) -> Response:
+        body = await request.body()
+        params = parse_form_body(body)
+        signature = request.headers.get("x-twilio-signature")
+        if not verifier.validate(
+            url=public_url_for_request(request, current_settings()),
+            params=params,
+            signature=signature,
+        ):
+            return error_response(
+                request=request,
+                status_code=status.HTTP_403_FORBIDDEN,
+                code="invalid_signature",
+                message="Invalid webhook signature.",
+                retryable=False,
+            )
+        await repo.record_twilio_call_status(
+            params=params,
+            payload_hash=sha256(body).hexdigest(),
+        )
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
     return app
 
 
@@ -210,3 +293,13 @@ def error_response(
             }
         },
     )
+
+
+def parse_form_body(body: bytes) -> dict[str, str]:
+    return {key: value for key, value in parse_qsl(body.decode("utf-8"), keep_blank_values=True)}
+
+
+def public_url_for_request(request: Request, settings: Settings) -> str:
+    path = request.url.path
+    query = f"?{request.url.query}" if request.url.query else ""
+    return f"{settings.app_public_base_url.rstrip('/')}{path}{query}"

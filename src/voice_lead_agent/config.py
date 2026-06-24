@@ -21,6 +21,14 @@ class Settings(BaseSettings):
     supabase_anon_key: str | None = Field(default=None, alias="SUPABASE_ANON_KEY")
     supabase_service_role_key: str | None = Field(default=None, alias="SUPABASE_SERVICE_ROLE_KEY")
 
+    worker_id: str = Field(default="worker-local", alias="WORKER_ID")
+    job_lease_seconds: int = Field(default=300, alias="JOB_LEASE_SECONDS")
+    job_retry_base_seconds: int = Field(default=300, alias="JOB_RETRY_BASE_SECONDS")
+
+    twilio_account_sid: str | None = Field(default=None, alias="TWILIO_ACCOUNT_SID")
+    twilio_auth_token: str | None = Field(default=None, alias="TWILIO_AUTH_TOKEN")
+    twilio_caller_id: str | None = Field(default=None, alias="TWILIO_CALLER_ID")
+
 
 @lru_cache
 def get_settings() -> Settings:
