@@ -1,10 +1,18 @@
+# Virtual environments
 .venv/
 
+# Python cache
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Temporary files
 .tmp.driveupload/
 .qoder/
