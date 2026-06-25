@@ -2,7 +2,7 @@
 
 This module owns the strict typed representations of every **inbound** JSON
 message that Twilio sends over the ConversationRelay WebSocket, plus the
-single **outbound** text-token message used to make Twilio speak.
+supported **outbound** messages used to make Twilio speak or end a session.
 
 Inbound JSON types: setup, prompt, interrupt, dtmf, error.
 WebSocket lifecycle events (connect, disconnect) are not part of this module.
@@ -202,7 +202,7 @@ InboundConversationRelayEvent = SetupEvent | PromptEvent | InterruptEvent | Dtmf
 
 
 # ---------------------------------------------------------------------------
-# Outbound text-token message
+# Outbound messages
 # ---------------------------------------------------------------------------
 
 
@@ -233,6 +233,57 @@ class TextTokenMessage(BaseModel):
         ``None`` optional fields are excluded so the payload is minimal.
         """
         return self.model_dump_json(exclude_none=True)
+
+
+MAX_HANDOFF_REASON_CODE_LENGTH = 64
+
+HANDOFF_REASON_OPTED_OUT = "opted-out"
+HANDOFF_REASON_NEEDS_HUMAN = "needs_human"
+HANDOFF_REASON_END_CALL = "end_call"
+HANDOFF_REASON_MAX_TURNS = "max_turns"
+
+
+class EndSessionHandoffData(BaseModel):
+    """Bounded non-sensitive reason information for an outbound end message."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    reason_code: str = Field(serialization_alias="reasonCode")
+
+    @field_validator("reason_code")
+    @classmethod
+    def _validate_reason_code(cls, value: str) -> str:
+        if not value:
+            raise ValueError("reasonCode must not be empty")
+        if len(value) > MAX_HANDOFF_REASON_CODE_LENGTH:
+            raise ValueError(
+                f"reasonCode exceeds maximum length of {MAX_HANDOFF_REASON_CODE_LENGTH}"
+            )
+        if any(not (ch.islower() or ch.isdigit() or ch in {"_", "-"}) for ch in value):
+            raise ValueError("reasonCode contains unsupported characters")
+        return value
+
+
+class EndSessionMessage(BaseModel):
+    """Outbound message that ends the ConversationRelay session."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    type: Literal["end"] = "end"
+    handoff_data: EndSessionHandoffData | None = Field(
+        default=None,
+        serialization_alias="handoffData",
+    )
+
+    def to_json(self) -> str:
+        """Serialise to the JSON wire format sent to Twilio."""
+        payload: dict[str, object] = {"type": "end"}
+        if self.handoff_data is not None:
+            payload["handoffData"] = json.dumps(
+                self.handoff_data.model_dump(by_alias=True),
+                separators=(",", ":"),
+            )
+        return json.dumps(payload, separators=(",", ":"))
 
 
 # ---------------------------------------------------------------------------
@@ -321,10 +372,17 @@ __all__ = [
     "ConversationRelayEventType",
     "ConversationRelayParseError",
     "DtmfEvent",
+    "EndSessionHandoffData",
+    "EndSessionMessage",
+    "HANDOFF_REASON_END_CALL",
+    "HANDOFF_REASON_MAX_TURNS",
+    "HANDOFF_REASON_NEEDS_HUMAN",
+    "HANDOFF_REASON_OPTED_OUT",
     "ErrorEvent",
     "InboundConversationRelayEvent",
     "InterruptEvent",
     "MAX_ERROR_DESCRIPTION_LENGTH",
+    "MAX_HANDOFF_REASON_CODE_LENGTH",
     "MAX_UTTERANCE_LENGTH",
     "MAX_VOICE_PROMPT_LENGTH",
     "PromptEvent",

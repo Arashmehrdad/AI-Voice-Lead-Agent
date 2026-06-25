@@ -16,12 +16,36 @@ from starlette.websockets import WebSocketDisconnect
 
 from voice_lead_agent.auth import require_trusted_source
 from voice_lead_agent.config import Settings, get_settings
+from voice_lead_agent.conversation_models import ConversationAction, ConversationTurn
+from voice_lead_agent.conversation_policy import redact_turn
+from voice_lead_agent.conversation_prompt import (
+    build_stage4_system_instruction,
+    build_stage4_welcome_greeting,
+)
 from voice_lead_agent.conversation_relay_protocol import (
+    HANDOFF_REASON_END_CALL,
+    HANDOFF_REASON_MAX_TURNS,
+    HANDOFF_REASON_NEEDS_HUMAN,
+    HANDOFF_REASON_OPTED_OUT,
     ConversationRelayParseError,
+    DtmfEvent,
+    EndSessionHandoffData,
+    EndSessionMessage,
+    ErrorEvent,
+    InterruptEvent,
+    PromptEvent,
     SetupEvent,
+    TextTokenMessage,
     parse_inbound_event,
 )
+from voice_lead_agent.conversation_service import DEFAULT_FALLBACK_SPOKEN_TEXT, process_turn
 from voice_lead_agent.errors import ApiError
+from voice_lead_agent.gemini_client import (
+    GeminiClientConfig,
+    GeminiConversationClient,
+    GeminiError,
+    GoogleGeminiConversationClient,
+)
 from voice_lead_agent.repositories import LeadRepository, TwilioWebhookRepository
 from voice_lead_agent.schemas import (
     LeadIntakeRequest,
@@ -33,12 +57,37 @@ from voice_lead_agent.schemas import (
 )
 from voice_lead_agent.service import intake_lead
 from voice_lead_agent.twilio_adapter import TwilioRequestValidator, TwilioSignatureVerifier
-from voice_lead_agent.twiml import fixed_stage3_twiml
+from voice_lead_agent.twiml import conversation_relay_twiml
 
 REQUEST_ID_HEADER = "X-Request-Id"
 MIGRATION_VERSION = "0001_initial_schema"
+MAX_TURNS_CLOSING_TEXT = "Thanks for your time. We will end this call here now. Goodbye."
 
 _log = logging.getLogger(__name__)
+
+GeminiClientFactory = Callable[[Settings], GeminiConversationClient | None]
+
+
+class LazyGeminiConversationClient:
+    """Lazy per-connection Gemini client wrapper.
+
+    The real Google Gemini client is constructed only if the conversation
+    service actually reaches the model boundary.
+    """
+
+    def __init__(self, *, settings: Settings, factory: GeminiClientFactory) -> None:
+        self._settings = settings
+        self._factory = factory
+        self._client: GeminiConversationClient | None = None
+        self._initialized = False
+
+    async def generate_decision(self, context: object) -> str:
+        if not self._initialized:
+            self._client = self._factory(self._settings)
+            self._initialized = True
+        if self._client is None:
+            raise GeminiError("gemini_unavailable", "Gemini is unavailable.")
+        return await self._client.generate_decision(context)  # type: ignore[arg-type]
 
 
 def create_app(
@@ -47,11 +96,13 @@ def create_app(
     repository: LeadRepository | None = None,
     twilio_webhook_repository: TwilioWebhookRepository | None = None,
     twilio_signature_verifier: TwilioSignatureVerifier | None = None,
+    gemini_client_factory: GeminiClientFactory | None = None,
 ) -> FastAPI:
     resolved_settings = settings
     resolved_repository = repository
     resolved_twilio_webhook_repository = twilio_webhook_repository
     resolved_twilio_signature_verifier = twilio_signature_verifier
+    resolved_gemini_client_factory = gemini_client_factory
     resolved_engine = None
 
     @asynccontextmanager
@@ -104,6 +155,12 @@ def create_app(
                 raise RuntimeError("TWILIO_AUTH_TOKEN is required for Twilio webhooks.")
             resolved_twilio_signature_verifier = TwilioRequestValidator(current.twilio_auth_token)
         return resolved_twilio_signature_verifier
+
+    def current_gemini_client_factory() -> GeminiClientFactory:
+        nonlocal resolved_gemini_client_factory
+        if resolved_gemini_client_factory is None:
+            resolved_gemini_client_factory = build_gemini_client
+        return resolved_gemini_client_factory
 
     async def trusted_source_dependency(
         authorization: str | None = Header(default=None),
@@ -217,8 +274,16 @@ def create_app(
                 message="Invalid webhook signature.",
                 retryable=False,
             )
+        current = current_settings()
         return Response(
-            content=fixed_stage3_twiml(),
+            content=conversation_relay_twiml(
+                websocket_url=conversationrelay_ws_url(current),
+                welcome_greeting=build_stage4_welcome_greeting(
+                    business_name=current.business_name,
+                    ai_disclosure_text=current.ai_disclosure_text,
+                ),
+                language=current.twilio_conversationrelay_language,
+            ),
             media_type="application/xml",
             status_code=status.HTTP_200_OK,
         )
@@ -261,10 +326,11 @@ def create_app(
             current_twilio_signature_verifier
         ),
     ) -> None:
+        settings = current_settings()
         signature = websocket.headers.get("x-twilio-signature")
         params: dict[str, str] = {}
         if not verifier.validate(
-            url=public_ws_url_for_request(websocket, current_settings()),
+            url=public_ws_url_for_request(websocket, settings),
             params=params,
             signature=signature,
         ):
@@ -272,6 +338,13 @@ def create_app(
             return
         await websocket.accept()
         setup_received = False
+        history: list[ConversationTurn] = []
+        completed_turns = 0
+        system_instruction = build_stage4_system_instruction(business_name=settings.business_name)
+        lazy_gemini_client = LazyGeminiConversationClient(
+            settings=settings,
+            factory=current_gemini_client_factory(),
+        )
         try:
             while True:
                 raw = await websocket.receive_text()
@@ -285,9 +358,64 @@ def create_app(
                     if setup_received:
                         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
                         return
+                    if (
+                        settings.twilio_account_sid is not None
+                        and event.account_sid != settings.twilio_account_sid
+                    ):
+                        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+                        return
                     setup_received = True
-                elif not setup_received:
+                    continue
+                if not setup_received:
                     await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+                    return
+                if isinstance(event, PromptEvent):
+                    if not event.last:
+                        continue
+                    if completed_turns >= settings.conversation_max_turns:
+                        if not await send_terminal_response(
+                            websocket=websocket,
+                            spoken_response=MAX_TURNS_CLOSING_TEXT,
+                            language=event.lang,
+                            reason_code=HANDOFF_REASON_MAX_TURNS,
+                        ):
+                            return
+                        return
+                    result = await process_turn(
+                        client=lazy_gemini_client,
+                        system_instruction=system_instruction,
+                        history=history,
+                        caller_text=event.voice_prompt,
+                        turn_number=completed_turns + 1,
+                        human_help_text=settings.human_help_text,
+                        fallback_text=DEFAULT_FALLBACK_SPOKEN_TEXT,
+                    )
+                    completed_turns += 1
+                    history.append(result.caller_turn)
+                    history.append(redact_turn("assistant", result.decision.spoken_response))
+                    if not await send_text_token_message(
+                        websocket=websocket,
+                        spoken_response=result.decision.spoken_response,
+                        language=event.lang,
+                    ):
+                        return
+                    if result.decision.action in {
+                        ConversationAction.END_CALL,
+                        ConversationAction.HUMAN_ESCALATION,
+                        ConversationAction.OPT_OUT,
+                    }:
+                        reason_code = handoff_reason_for_action(result.decision.action)
+                        await send_end_session_message(
+                            websocket=websocket,
+                            reason_code=reason_code,
+                        )
+                        return
+                    continue
+                if isinstance(event, (InterruptEvent, DtmfEvent)):
+                    continue
+                if isinstance(event, ErrorEvent):
+                    _log.warning("ConversationRelay provider error, closing session")
+                    await safe_close_websocket(websocket)
                     return
         except WebSocketDisconnect:
             pass
@@ -359,3 +487,97 @@ def public_ws_url_for_request(websocket: WebSocket, settings: Settings) -> str:
     raw_query = websocket.scope.get("query_string", b"").decode("latin-1")
     query = f"?{raw_query}" if raw_query else ""
     return f"{ws_base}{path}{query}"
+
+
+def conversationrelay_ws_url(settings: Settings) -> str:
+    base = settings.app_public_base_url.rstrip("/")
+    ws_base = base.replace("https://", "wss://").replace("http://", "wss://")
+    return f"{ws_base}/ws/twilio/conversationrelay"
+
+
+def build_gemini_client(settings: Settings) -> GeminiConversationClient | None:
+    if not settings.gemini_api_key:
+        return None
+    from google.genai import Client as GenaiClient
+
+    return GoogleGeminiConversationClient(
+        client=GenaiClient(api_key=settings.gemini_api_key),
+        config=GeminiClientConfig(
+            model=settings.gemini_model,
+            timeout_seconds=settings.gemini_timeout_seconds,
+            max_output_tokens=settings.gemini_max_output_tokens,
+            temperature=settings.gemini_temperature,
+        ),
+    )
+
+
+async def send_text_token_message(
+    *,
+    websocket: WebSocket,
+    spoken_response: str,
+    language: str,
+) -> bool:
+    message = TextTokenMessage(
+        token=spoken_response,
+        last=True,
+        lang=language,
+        interruptible=True,
+        preemptible=False,
+    )
+    try:
+        await websocket.send_text(message.to_json())
+    except WebSocketDisconnect:
+        return False
+    except RuntimeError:
+        _log.warning("ConversationRelay outbound send failed")
+        return False
+    return True
+
+
+def handoff_reason_for_action(action: ConversationAction) -> str:
+    if action == ConversationAction.OPT_OUT:
+        return HANDOFF_REASON_OPTED_OUT
+    if action == ConversationAction.HUMAN_ESCALATION:
+        return HANDOFF_REASON_NEEDS_HUMAN
+    return HANDOFF_REASON_END_CALL
+
+
+async def send_end_session_message(
+    *,
+    websocket: WebSocket,
+    reason_code: str,
+) -> bool:
+    message = EndSessionMessage(
+        handoff_data=EndSessionHandoffData(reason_code=reason_code),
+    )
+    try:
+        await websocket.send_text(message.to_json())
+    except WebSocketDisconnect:
+        return False
+    except RuntimeError:
+        _log.warning("ConversationRelay outbound send failed")
+        return False
+    return True
+
+
+async def send_terminal_response(
+    *,
+    websocket: WebSocket,
+    spoken_response: str,
+    language: str,
+    reason_code: str,
+) -> bool:
+    if not await send_text_token_message(
+        websocket=websocket,
+        spoken_response=spoken_response,
+        language=language,
+    ):
+        return False
+    return await send_end_session_message(websocket=websocket, reason_code=reason_code)
+
+
+async def safe_close_websocket(websocket: WebSocket) -> None:
+    try:
+        await websocket.close()
+    except RuntimeError:
+        _log.warning("ConversationRelay close failed")

@@ -29,6 +29,10 @@ class Settings(BaseSettings):
     twilio_account_sid: str | None = Field(default=None, alias="TWILIO_ACCOUNT_SID")
     twilio_auth_token: str | None = Field(default=None, alias="TWILIO_AUTH_TOKEN")
     twilio_caller_id: str | None = Field(default=None, alias="TWILIO_CALLER_ID")
+    twilio_conversationrelay_language: str = Field(
+        default="en-GB",
+        alias="TWILIO_CONVERSATIONRELAY_LANGUAGE",
+    )
 
     # Gemini conversation loop (Stage 4). No default API key: callers must provide one.
     gemini_api_key: str | None = Field(default=None, alias="GEMINI_API_KEY")
@@ -49,7 +53,8 @@ class Settings(BaseSettings):
     )
     human_help_text: str = Field(
         default=(
-            "I'll arrange for a member of our team to follow up with you. Thank you for your time."
+            "I understand that you want human help. I cannot transfer this call, "
+            "so I will end it now. Goodbye."
         ),
         alias="HUMAN_HELP_TEXT",
     )

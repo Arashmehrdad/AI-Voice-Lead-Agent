@@ -33,7 +33,8 @@ _log = logging.getLogger(__name__)
 
 # Fixed application-owned spoken text for deterministic paths.
 OPT_OUT_SPOKEN_TEXT = (
-    "I understand. I will make sure no further calls are made. Thank you for your time. Goodbye."
+    "I understand. I have recognised your request to stop these automated calls. "
+    "This call will end now. Goodbye."
 )
 DEFAULT_FALLBACK_SPOKEN_TEXT = (
     "I'm sorry, I'm having a little trouble right now. Could you please repeat that?"

@@ -15,12 +15,17 @@ import pytest
 from pydantic import ValidationError
 
 from voice_lead_agent.conversation_relay_protocol import (
+    HANDOFF_REASON_END_CALL,
+    HANDOFF_REASON_OPTED_OUT,
     MAX_ERROR_DESCRIPTION_LENGTH,
+    MAX_HANDOFF_REASON_CODE_LENGTH,
     MAX_UTTERANCE_LENGTH,
     MAX_VOICE_PROMPT_LENGTH,
     ConversationRelayEventType,
     ConversationRelayParseError,
     DtmfEvent,
+    EndSessionHandoffData,
+    EndSessionMessage,
     ErrorEvent,
     InterruptEvent,
     PromptEvent,
@@ -809,6 +814,53 @@ def test_text_token_rejects_token_none() -> None:
     """token=None must be rejected; str does not accept None."""
     with pytest.raises(ValidationError):
         TextTokenMessage(token=None)  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# Outbound EndSessionMessage — exact JSON shape
+# ---------------------------------------------------------------------------
+
+
+def test_end_session_minimal_json() -> None:
+    msg = EndSessionMessage()
+    payload = json.loads(msg.to_json())
+    assert payload == {"type": "end"}
+
+
+def test_end_session_with_handoff_data_serializes_reason_code() -> None:
+    msg = EndSessionMessage(
+        handoff_data=EndSessionHandoffData(reason_code=HANDOFF_REASON_OPTED_OUT)
+    )
+    payload = json.loads(msg.to_json())
+    assert payload["type"] == "end"
+    handoff = json.loads(payload["handoffData"])
+    assert handoff == {"reasonCode": HANDOFF_REASON_OPTED_OUT}
+
+
+def test_end_session_handoff_rejects_extra_fields() -> None:
+    with pytest.raises(ValidationError):
+        EndSessionHandoffData(reason_code="opted-out", caller="secret")  # type: ignore[call-arg]
+
+
+def test_end_session_rejects_extra_fields() -> None:
+    with pytest.raises(ValidationError):
+        EndSessionMessage(extra="nope")  # type: ignore[call-arg]
+
+
+def test_end_session_handoff_rejects_unbounded_reason_code() -> None:
+    with pytest.raises(ValidationError):
+        EndSessionHandoffData(reason_code="A" * (MAX_HANDOFF_REASON_CODE_LENGTH + 1))
+
+
+def test_end_session_handoff_rejects_sensitive_characters() -> None:
+    with pytest.raises(ValidationError):
+        EndSessionHandoffData(reason_code="caller@example.com")
+
+
+def test_end_session_handoff_accepts_documented_reason_codes() -> None:
+    for reason in (HANDOFF_REASON_OPTED_OUT, HANDOFF_REASON_END_CALL, "needs_human", "max_turns"):
+        handoff = EndSessionHandoffData(reason_code=reason)
+        assert handoff.reason_code == reason
 
 
 # ---------------------------------------------------------------------------
